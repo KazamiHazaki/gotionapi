@@ -228,15 +228,36 @@ var accounts []Account
 // ============================================================
 
 type ChatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string          `json:"role"`
+	Content    json.RawMessage `json:"content"`
+	Name       string          `json:"name,omitempty"`
+	ToolCallID string          `json:"tool_call_id,omitempty"`
 }
 
 type ChatCompletionRequest struct {
-	Model          string        `json:"model"`
-	Messages       []ChatMessage `json:"messages"`
-	Stream         bool          `json:"stream"`
-	ConversationID string        `json:"conversation_id,omitempty"` // heavy mode only
+	Model                string        `json:"model"`
+	Messages             []ChatMessage `json:"messages"`
+	Stream               bool          `json:"stream"`
+	ConversationID       string        `json:"conversation_id,omitempty"` // heavy mode only
+	Temperature          *float64      `json:"temperature,omitempty"`
+	TopP                 *float64      `json:"top_p,omitempty"`
+	N                    *int          `json:"n,omitempty"`
+	MaxTokens            *int          `json:"max_tokens,omitempty"`
+	MaxCompletionTokens  *int          `json:"max_completion_tokens,omitempty"`
+	Stop                 interface{}   `json:"stop,omitempty"`
+	PresencePenalty      *float64      `json:"presence_penalty,omitempty"`
+	FrequencyPenalty     *float64      `json:"frequency_penalty,omitempty"`
+	LogitBias            interface{}   `json:"logit_bias,omitempty"`
+	Logprobs             *bool         `json:"logprobs,omitempty"`
+	TopLogprobs          *int          `json:"top_logprobs,omitempty"`
+	User                 string        `json:"user,omitempty"`
+	Seed                 *int          `json:"seed,omitempty"`
+	ResponseFormat       interface{}   `json:"response_format,omitempty"`
+	Tools                interface{}   `json:"tools,omitempty"`
+	ToolChoice           interface{}   `json:"tool_choice,omitempty"`
+	ParallelToolCalls    *bool         `json:"parallel_tool_calls,omitempty"`
+	ServiceTier          string        `json:"service_tier,omitempty"`
+	StreamOptions        interface{}   `json:"stream_options,omitempty"`
 }
 
 type ChatCompletionChoice struct {
@@ -246,12 +267,20 @@ type ChatCompletionChoice struct {
 	FinishReason *string      `json:"finish_reason,omitempty"`
 }
 
+type UsageInfo struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
 type ChatCompletionResponse struct {
-	ID      string                 `json:"id"`
-	Object  string                 `json:"object"`
-	Created int64                  `json:"created"`
-	Model   string                 `json:"model"`
-	Choices []ChatCompletionChoice `json:"choices"`
+	ID                string                 `json:"id"`
+	Object            string                 `json:"object"`
+	Created           int64                  `json:"created"`
+	Model             string                 `json:"model"`
+	Choices           []ChatCompletionChoice `json:"choices"`
+	Usage             *UsageInfo             `json:"usage,omitempty"`
+	SystemFingerprint string                 `json:"system_fingerprint,omitempty"`
 }
 
 type ModelInfo struct {
@@ -300,6 +329,42 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// contentRaw converts a plain string to json.RawMessage for ChatMessage.Content
+func contentRaw(s string) json.RawMessage {
+	b, _ := json.Marshal(s)
+	return json.RawMessage(b)
+}
+
+// extractContentString normalizes ChatMessage.Content (json.RawMessage) to a plain string.
+// Handles: null, "string", [{"type":"text","text":"..."}], [{"type":"image_url",...}]
+func extractContentString(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	// Try as plain string first
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	// Try as array of content parts (OpenAI multimodal format)
+	var parts []struct {
+		Type string          `json:"type"`
+		Text string          `json:"text"`
+		Raw  json.RawMessage `json:"image_url"`
+	}
+	if err := json.Unmarshal(raw, &parts); err == nil {
+		var texts []string
+		for _, p := range parts {
+			if p.Type == "text" && p.Text != "" {
+				texts = append(texts, p.Text)
+			}
+		}
+		return strings.Join(texts, "\n")
+	}
+	// Fallback: raw string representation
+	return string(raw)
 }
 
 func mustJSON(v interface{}) string {
@@ -1140,7 +1205,7 @@ func buildTranscript(req ChatCompletionRequest, acc Account, notionModel, thread
 			transcript = append(transcript, map[string]interface{}{
 				"id":        genUUID(),
 				"type":      "user",
-				"value":     [][]string{{"[System]: " + msg.Content}},
+				"value":     [][]string{{"[System]: " + extractContentString(msg.Content)}},
 				"userId":    acc.UserID,
 				"createdAt": time.Now().Format(time.RFC3339Nano),
 			})
@@ -1148,7 +1213,7 @@ func buildTranscript(req ChatCompletionRequest, acc Account, notionModel, thread
 			transcript = append(transcript, map[string]interface{}{
 				"id":        genUUID(),
 				"type":      "user",
-				"value":     [][]string{{msg.Content}},
+				"value":     [][]string{{extractContentString(msg.Content)}},
 				"userId":    acc.UserID,
 				"createdAt": time.Now().Format(time.RFC3339Nano),
 			})
@@ -1156,8 +1221,32 @@ func buildTranscript(req ChatCompletionRequest, acc Account, notionModel, thread
 			transcript = append(transcript, map[string]interface{}{
 				"id":    genUUID(),
 				"type":  "assistant",
-				"value": msg.Content,
+				"value": extractContentString(msg.Content),
 			})
+		case "tool":
+			// Tool results — treat as user context for Notion
+			content := extractContentString(msg.Content)
+			if content != "" {
+				transcript = append(transcript, map[string]interface{}{
+					"id":        genUUID(),
+					"type":      "user",
+					"value":     [][]string{{"[Tool Result]: " + content}},
+					"userId":    acc.UserID,
+					"createdAt": time.Now().Format(time.RFC3339Nano),
+				})
+			}
+		default:
+			// Unknown role — treat as user message
+			content := extractContentString(msg.Content)
+			if content != "" {
+				transcript = append(transcript, map[string]interface{}{
+					"id":        genUUID(),
+					"type":      "user",
+					"value":     [][]string{{fmt.Sprintf("[%s]: %s", msg.Role, content)}},
+					"userId":    acc.UserID,
+					"createdAt": time.Now().Format(time.RFC3339Nano),
+				})
+			}
 		}
 	}
 
@@ -1170,7 +1259,7 @@ func buildLiteTranscript(req ChatCompletionRequest, acc Account, notionModel, th
 	lastUserMsg := ""
 	for i := len(req.Messages) - 1; i >= 0; i-- {
 		if req.Messages[i].Role == "user" {
-			lastUserMsg = req.Messages[i].Content
+			lastUserMsg = extractContentString(req.Messages[i].Content)
 			break
 		}
 	}
@@ -1671,7 +1760,7 @@ func handleHeavyRequest(w http.ResponseWriter, r *http.Request, req ChatCompleti
 	lastUserMsg := ""
 	for i := len(req.Messages) - 1; i >= 0; i-- {
 		if req.Messages[i].Role == "user" {
-			lastUserMsg = req.Messages[i].Content
+			lastUserMsg = extractContentString(req.Messages[i].Content)
 			break
 		}
 	}
@@ -1785,7 +1874,7 @@ func handleHeavyStreamResponse(w http.ResponseWriter, ctx context.Context, body 
 			}
 			chunk := ChatCompletionResponse{
 				ID: chatID, Object: "chat.completion.chunk", Created: time.Now().Unix(), Model: model,
-				Choices: []ChatCompletionChoice{{Index: 0, Delta: &ChatMessage{Content: text}}},
+				Choices: []ChatCompletionChoice{{Index: 0, Delta: &ChatMessage{Content: contentRaw(text)}}},
 			}
 			fmt.Fprintf(w, "data: %s\n\n", mustJSON(chunk))
 			flusher.Flush()
@@ -1820,7 +1909,7 @@ func handleHeavyStreamResponse(w http.ResponseWriter, ctx context.Context, body 
 			Model:   model,
 			Choices: []ChatCompletionChoice{{
 				Index: 0,
-				Delta: &ChatMessage{Content: text},
+				Delta: &ChatMessage{Content: contentRaw(text)},
 			}},
 		}
 		fmt.Fprintf(w, "data: %s\n\n", mustJSON(chunk))
@@ -1898,8 +1987,10 @@ func handleHeavyNonStreamResponse(w http.ResponseWriter, body io.Reader, chatID,
 		Model:   model,
 		Choices: []ChatCompletionChoice{{
 			Index:   0,
-			Message: &ChatMessage{Role: "assistant", Content: totalText},
+			Message: &ChatMessage{Role: "assistant", Content: contentRaw(totalText)},
 		}},
+		Usage:             &UsageInfo{PromptTokens: 0, CompletionTokens: 0, TotalTokens: 0},
+		SystemFingerprint: "fp_gotionapi",
 	})
 }
 
@@ -1952,7 +2043,7 @@ func handleStreamResponse(w http.ResponseWriter, ctx context.Context, body io.Re
 			}
 			chunk := ChatCompletionResponse{
 				ID: chatID, Object: "chat.completion.chunk", Created: time.Now().Unix(), Model: model,
-				Choices: []ChatCompletionChoice{{Index: 0, Delta: &ChatMessage{Content: text}}},
+				Choices: []ChatCompletionChoice{{Index: 0, Delta: &ChatMessage{Content: contentRaw(text)}}},
 			}
 			fmt.Fprintf(w, "data: %s\n\n", mustJSON(chunk))
 			flusher.Flush()
@@ -1987,7 +2078,7 @@ func handleStreamResponse(w http.ResponseWriter, ctx context.Context, body io.Re
 			Model:   model,
 			Choices: []ChatCompletionChoice{{
 				Index: 0,
-				Delta: &ChatMessage{Content: text},
+				Delta: &ChatMessage{Content: contentRaw(text)},
 			}},
 		}
 		fmt.Fprintf(w, "data: %s\n\n", mustJSON(chunk))
@@ -2050,8 +2141,10 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, chatID, mode
 		Model:   model,
 		Choices: []ChatCompletionChoice{{
 			Index:   0,
-			Message: &ChatMessage{Role: "assistant", Content: result.String()},
+			Message: &ChatMessage{Role: "assistant", Content: contentRaw(result.String())},
 		}},
+		Usage:             &UsageInfo{PromptTokens: 0, CompletionTokens: 0, TotalTokens: 0},
+		SystemFingerprint: "fp_gotionapi",
 	})
 }
 
