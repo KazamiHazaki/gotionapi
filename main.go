@@ -152,7 +152,11 @@ type Account struct {
 }
 
 const accountsFile = "accounts.json"
+const apiKeyFile = ".apikey"
 const notionClientVersion = "23.13.20260228.0625"
+
+// API key for Bearer auth (empty = no auth required)
+var apiKey string
 
 // Debug mode — set NOTION2API_DEBUG=1 to log raw Notion responses
 var debugMode bool
@@ -443,6 +447,90 @@ func saveAccounts() {
 	}
 }
 
+// ============================================================
+// API Key management
+// ============================================================
+
+func generateAPIKey() string {
+	b := make([]byte, 32)
+	rand.Read(b)
+	return "sk-" + hex.EncodeToString(b)
+}
+
+func loadAPIKey() {
+	// Priority: API_KEY env var > .apikey file
+	if envKey := os.Getenv("API_KEY"); envKey != "" {
+		apiKey = envKey
+		return
+	}
+	data, err := os.ReadFile(apiKeyFile)
+	if err == nil {
+		apiKey = strings.TrimSpace(string(data))
+		return
+	}
+	// No API key found — auto-generate if accounts exist
+	if len(accounts) > 0 {
+		apiKey = generateAPIKey()
+		saveAPIKey()
+	}
+}
+
+func saveAPIKey() {
+	if err := os.WriteFile(apiKeyFile, []byte(apiKey+"\n"), 0600); err != nil {
+		log.Printf("Failed to write %s: %v", apiKeyFile, err)
+	}
+}
+
+func regenerateAPIKey() {
+	apiKey = generateAPIKey()
+	saveAPIKey()
+}
+
+// requireAuth is a middleware that checks Bearer token
+func requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if apiKey == "" {
+			next(w, r)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, "Bearer ") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(ErrorResponse{
+				Error: struct {
+					Message string `json:"message"`
+					Type    string `json:"type"`
+					Code    string `json:"code"`
+				}{
+					Message: "Missing or invalid Authorization header. Use: Bearer <api_key>",
+					Type:    "invalid_request_error",
+					Code:    "unauthorized",
+				},
+			})
+			return
+		}
+		token := strings.TrimPrefix(auth, "Bearer ")
+		if token != apiKey {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(ErrorResponse{
+				Error: struct {
+					Message string `json:"message"`
+					Type    string `json:"type"`
+					Code    string `json:"code"`
+				}{
+					Message: "Invalid API key",
+					Type:    "invalid_request_error",
+					Code:    "unauthorized",
+				},
+			})
+			return
+		}
+		next(w, r)
+	}
+}
+
 func promptAccounts() {
 	fmt.Println("\n╔══════════════════════════════════════════════════╗")
 	fmt.Println("║       Notion2API Go — First Run Setup            ║")
@@ -469,7 +557,10 @@ func promptAccounts() {
 	}
 	accounts = append(accounts, acc)
 	saveAccounts()
-	fmt.Printf("\n✓ Account saved to %s\n\n", accountsFile)
+	regenerateAPIKey()
+	fmt.Printf("\n✓ Account saved to %s\n", accountsFile)
+	fmt.Printf("🔑 API Key: %s\n", apiKey)
+	fmt.Printf("   (saved to %s — use this as Bearer token)\n\n", apiKeyFile)
 }
 
 func getAccount() Account {
@@ -1972,6 +2063,23 @@ func main() {
 	loadDotEnv()    // Load .env file before anything else
 	initDebugMode() // Re-evaluate debug mode after .env
 
+	// CLI commands
+	if len(os.Args) > 1 {
+		cmd := os.Args[1]
+		switch cmd {
+		case "apikey-reset", "apikey-regenerate":
+			loadAccounts()
+			regenerateAPIKey()
+			fmt.Println("🔑 New API Key:", apiKey)
+			fmt.Printf("   Saved to %s\n", apiKeyFile)
+			return
+		default:
+			fmt.Fprintf(os.Stderr, "Unknown command: %s\n", cmd)
+			fmt.Fprintf(os.Stderr, "Available commands: apikey-reset, apikey-regenerate\n")
+			os.Exit(1)
+		}
+	}
+
 	// APP_MODE: lite, standard, heavy (default: heavy)
 	appMode = strings.ToLower(os.Getenv("APP_MODE"))
 	if appMode == "" {
@@ -1989,6 +2097,8 @@ func main() {
 	if !loadAccounts() {
 		promptAccounts()
 	}
+
+	loadAPIKey()
 
 	// Initialize SQLite for heavy mode
 	if appMode == "heavy" {
@@ -2010,14 +2120,19 @@ func main() {
 
 	http.HandleFunc("/", handleRoot)
 	http.HandleFunc("/health", handleHealth)
-	http.HandleFunc("/v1/models", handleModels)
-	http.HandleFunc("/v1/chat/completions", handleChatCompletions)
+	http.HandleFunc("/v1/models", requireAuth(handleModels))
+	http.HandleFunc("/v1/chat/completions", requireAuth(handleChatCompletions))
 
-	log.Printf("🚀 Notion2API Go v3.0.0 starting on :%s", port)
+	log.Printf("🚀 GoTionAPI v3.1.0 starting on :%s", port)
 	log.Printf("📋 Models: %d registered", len(modelMap))
 	log.Printf("👤 Accounts: %d loaded", len(accounts))
 	log.Printf("🔑 Default model: %s", defaultModel)
 	log.Printf("⚙️  APP_MODE: %s", appMode)
+	if apiKey != "" {
+		log.Printf("🔐 API Key: %s (Bearer auth enabled)", apiKey)
+	} else {
+		log.Printf("🔓 API Key: not set (auth disabled)")
+	}
 	if debugMode {
 		log.Printf("🐛 Debug mode ON (NOTION2API_DEBUG=1)")
 	}

@@ -29,16 +29,57 @@ Input your key :
 }
 ```
 
+An API key is auto-generated and displayed:
+
+```
+✓ Account saved to accounts.json
+🔑 API Key: sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+   (saved to .apikey — use this as Bearer token)
+```
+
 Server starts on `http://localhost:8000`.
+
+## API Key Authentication
+
+All `/v1/*` endpoints require Bearer token authentication. Public endpoints (`/health`, `/`) are unauthenticated.
+
+```bash
+# Include the API key in requests
+curl http://localhost:8000/v1/models \
+  -H "Authorization: Bearer sk-your-api-key-here"
+
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-api-key-here" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "claude-sonnet4.6", "messages": [{"role": "user", "content": "Hello!"}]}'
+```
+
+### CLI Commands
+
+```bash
+# Regenerate API key
+./gotionapi apikey-reset
+
+# Same as above (alias)
+./gotionapi apikey-regenerate
+```
+
+### Key Loading Priority
+
+1. `API_KEY` environment variable
+2. `.apikey` file
+3. Auto-generated on first run (if accounts exist)
 
 ## Usage
 
 ```bash
 # List models
-curl http://localhost:8000/v1/models
+curl http://localhost:8000/v1/models \
+  -H "Authorization: Bearer sk-your-api-key"
 
 # Chat completion (non-stream)
 curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "claude-sonnet4.6",
@@ -47,6 +88,7 @@ curl http://localhost:8000/v1/chat/completions \
 
 # Chat completion (stream)
 curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "kimi-2.6",
@@ -54,7 +96,7 @@ curl http://localhost:8000/v1/chat/completions \
     "stream": true
   }'
 
-# Health check
+# Health check (no auth required)
 curl http://localhost:8000/health
 ```
 
@@ -91,6 +133,7 @@ Pass `conversation_id` in the request body to continue a conversation:
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk-your-api-key" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "claude-sonnet4.6",
@@ -109,6 +152,7 @@ All via environment variables or `.env` file:
 |---|---|---|
 | `APP_MODE` | `heavy` | `lite`, `standard`, or `heavy` |
 | `PORT` | `8000` | Server listen port |
+| `API_KEY` | auto-generated | Bearer token for auth (set to override) |
 | `NOTION_ACCOUNTS` | — | JSON account config (fallback if no `accounts.json`) |
 | `DB_PATH` | `./data/conversations.db` | SQLite path (heavy mode only) |
 | `NOTION2API_DEBUG` | — | Set `1` for verbose logging |
@@ -147,9 +191,10 @@ Client (OpenAI SDK / curl)
   ▼
 GoTionAPI Server (Go binary)
   │  ┌─────────────────────┐
-  │  │ uTLS Chrome JA3     │ ← impersonates Chrome TLS fingerprint
-  │  │ HTTP/1.1             │
-  │  └─────────┬───────────┘
+  │  │ Bearer Auth (API Key)│ ← auto-generated sk-* key
+  │  │ uTLS Chrome JA3      │ ← impersonates Chrome TLS fingerprint
+  │  │ HTTP/1.1              │
+  │  └─────────┬────────────┘
   ▼            ▼
 Notion API  ─  /api/v3/runInferenceTranscript
 ```
@@ -159,6 +204,7 @@ Key technical decisions:
 - **HTTP/1.1 only** — strips `h2` from ALPN because `*utls.UConn` breaks Go's h2 transport detection
 - **Fresh TLS spec per connection** — `UTLSIdToSpec(HelloChrome_Auto)` + `ApplyPreset(HelloCustom)`
 - **Pure Go SQLite** (`modernc.org/sqlite`) — no CGO required
+- **API Key auth** — auto-generated on first run, stored in `.apikey`, configurable via `API_KEY` env var
 
 ## License
 

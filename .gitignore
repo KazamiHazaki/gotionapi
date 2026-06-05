@@ -6,6 +6,7 @@ gotionapi-*
 # Data
 data/
 accounts.json
+.apikey
 
 # Env
 .env
