@@ -1,0 +1,18 @@
+# Binaries
+gotionapi
+gotionapi-*
+*.exe
+
+# Data
+data/
+accounts.json
+
+# Env
+.env
+
+# Go
+/go
+
+# OS
+.DS_Store
+Thumbs.db
