@@ -431,7 +431,9 @@ var (
 	reLangOpen    = regexp.MustCompile(`<lang\b[^>]*>`)
 	reLangClose   = regexp.MustCompile(`</lang>`)
 	rePrimaryAttr = regexp.MustCompile(`(?i)\bprimary="[a-zA-Z\-]{1,15}"\s*`)
-	reAttrTail    = regexp.MustCompile(`^-?[a-zA-Z]{0,4}"\s*>\s*`)
+	reAttrTail        = regexp.MustCompile(`^-?[a-zA-Z]{0,4}"\s*>\s*`)
+	reReasoningPrefix = regexp.MustCompile(`(?i)^(?:general knowledge question|simple request|the user (?:wants|is asking)|this is (?:a )?(?:general|simple|straightforward)|no need to (?:search|look up)|search(?:ing)? (?:for|not needed))[.!?\s]*`)
+	reOrphanLangOpen = regexp.MustCompile(`<lang\b[^>]*$`)
 )
 
 func cleanNotionMarkup(text string) string {
@@ -441,6 +443,8 @@ func cleanNotionMarkup(text string) string {
 	text = reLangClose.ReplaceAllString(text, "")
 	// 3. orphan <lang ...>
 	text = reLangOpen.ReplaceAllString(text, "")
+	// 3.5. truncated <lang ... (missing closing >)
+	text = reOrphanLangOpen.ReplaceAllString(text, "")
 	// 4. primary="zh-CN" fragments
 	text = rePrimaryAttr.ReplaceAllString(text, "")
 	// 5. attr tail fragments at line start
@@ -449,6 +453,39 @@ func cleanNotionMarkup(text string) string {
 		lines[i] = reAttrTail.ReplaceAllString(line, "")
 	}
 	return strings.Join(lines, "\n")
+}
+
+// cleanResponseText removes reasoning prefixes, deduplicates content, and strips markup.
+func cleanResponseText(text string) string {
+	if text == "" {
+		return text
+	}
+
+	// 1. Clean Notion markup (lang tags, br tags, etc.)
+	text = cleanNotionMarkup(text)
+
+	// 2. Strip reasoning prefixes that leak from Notion AI
+	text = reReasoningPrefix.ReplaceAllString(text, "")
+
+	// 3. Deduplicate: if content appears twice (artifacted + clean), keep only the last copy
+	paragraphs := strings.Split(text, "\n\n")
+	if len(paragraphs) >= 4 {
+		half := len(paragraphs) / 2
+		firstHalf := strings.TrimSpace(strings.Join(paragraphs[:half], "\n\n"))
+		secondHalf := strings.TrimSpace(strings.Join(paragraphs[half:], "\n\n"))
+		if len(firstHalf) > 20 && len(secondHalf) > 20 {
+			// Check if second half starts with same content as first half
+			minLen := len(firstHalf)
+			if minLen > 100 {
+				minLen = 100
+			}
+			if strings.HasPrefix(secondHalf, firstHalf[:minLen]) {
+				text = secondHalf
+			}
+		}
+	}
+
+	return strings.TrimSpace(text)
 }
 
 // resolveModel maps friendly name → Notion internal model ID
@@ -1376,6 +1413,7 @@ func extractTextFromNDJSON(line string) (text string, done bool) {
 	if dataType == "record-map" {
 		text = extractFromRecordMap(obj)
 		if text != "" {
+			text = cleanNotionMarkup(text)
 			debugLog("record-map extracted: %s", truncate(text, 200))
 		}
 		return text, false
@@ -1874,7 +1912,7 @@ func handleHeavyStreamResponse(w http.ResponseWriter, ctx context.Context, body 
 			}
 			chunk := ChatCompletionResponse{
 				ID: chatID, Object: "chat.completion.chunk", Created: time.Now().Unix(), Model: model,
-				Choices: []ChatCompletionChoice{{Index: 0, Delta: &ChatMessage{Content: contentRaw(text)}}},
+				Choices: []ChatCompletionChoice{{Index: 0, Delta: &ChatMessage{Content: contentRaw(cleanNotionMarkup(text))}}},
 			}
 			fmt.Fprintf(w, "data: %s\n\n", mustJSON(chunk))
 			flusher.Flush()
@@ -1909,7 +1947,7 @@ func handleHeavyStreamResponse(w http.ResponseWriter, ctx context.Context, body 
 			Model:   model,
 			Choices: []ChatCompletionChoice{{
 				Index: 0,
-				Delta: &ChatMessage{Content: contentRaw(text)},
+				Delta: &ChatMessage{Content: contentRaw(cleanNotionMarkup(text))},
 			}},
 		}
 		fmt.Fprintf(w, "data: %s\n\n", mustJSON(chunk))
@@ -1987,7 +2025,7 @@ func handleHeavyNonStreamResponse(w http.ResponseWriter, body io.Reader, chatID,
 		Model:   model,
 		Choices: []ChatCompletionChoice{{
 			Index:   0,
-			Message: &ChatMessage{Role: "assistant", Content: contentRaw(totalText)},
+			Message: &ChatMessage{Role: "assistant", Content: contentRaw(cleanResponseText(totalText))},
 		}},
 		Usage:             &UsageInfo{PromptTokens: 0, CompletionTokens: 0, TotalTokens: 0},
 		SystemFingerprint: "fp_gotionapi",
@@ -2043,7 +2081,7 @@ func handleStreamResponse(w http.ResponseWriter, ctx context.Context, body io.Re
 			}
 			chunk := ChatCompletionResponse{
 				ID: chatID, Object: "chat.completion.chunk", Created: time.Now().Unix(), Model: model,
-				Choices: []ChatCompletionChoice{{Index: 0, Delta: &ChatMessage{Content: contentRaw(text)}}},
+				Choices: []ChatCompletionChoice{{Index: 0, Delta: &ChatMessage{Content: contentRaw(cleanNotionMarkup(text))}}},
 			}
 			fmt.Fprintf(w, "data: %s\n\n", mustJSON(chunk))
 			flusher.Flush()
@@ -2078,7 +2116,7 @@ func handleStreamResponse(w http.ResponseWriter, ctx context.Context, body io.Re
 			Model:   model,
 			Choices: []ChatCompletionChoice{{
 				Index: 0,
-				Delta: &ChatMessage{Content: contentRaw(text)},
+				Delta: &ChatMessage{Content: contentRaw(cleanNotionMarkup(text))},
 			}},
 		}
 		fmt.Fprintf(w, "data: %s\n\n", mustJSON(chunk))
@@ -2141,7 +2179,7 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, chatID, mode
 		Model:   model,
 		Choices: []ChatCompletionChoice{{
 			Index:   0,
-			Message: &ChatMessage{Role: "assistant", Content: contentRaw(result.String())},
+			Message: &ChatMessage{Role: "assistant", Content: contentRaw(cleanResponseText(result.String()))},
 		}},
 		Usage:             &UsageInfo{PromptTokens: 0, CompletionTokens: 0, TotalTokens: 0},
 		SystemFingerprint: "fp_gotionapi",
