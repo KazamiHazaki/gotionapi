@@ -4,6 +4,8 @@ Notion AI → OpenAI-compatible API server. Single Go binary, zero runtime depen
 
 Uses [uTLS](https://github.com/refraction-networking/utls) Chrome JA3 fingerprint impersonation to bypass Notion's bot detection — same technique as the Python `cloudscraper` approach, but compiled into a standalone binary.
 
+**v3.2.0** — Response filter strips Notion AI artifacts (reasoning prefixes, `<lang>` tags, content duplication) from all responses.
+
 ## Quick Start
 
 ```bash
@@ -144,6 +146,20 @@ curl http://localhost:8000/v1/chat/completions \
 
 Conversations are stored in SQLite (`DB_PATH`, default `./data/conversations.db`).
 
+## Response Filter (v3.2.0)
+
+Notion AI responses often contain internal artifacts that leak into the output. GoTionAPI automatically cleans these:
+
+| Artifact | Example | Fix |
+|---|---|---|
+| Reasoning prefix | `General knowledge question.` at start | Regex strip |
+| `<lang>` tags | `<lang primary="en-US">content</lang>` | Tag removal, content preserved |
+| Truncated lang tags | `<lang primary="en-` (missing `>`) | Orphan tag regex |
+| `primary="xx-XX"` attr | `primary="zh-CN"` fragments in text | Attribute strip |
+| Content duplication | Same response appears twice (artifacted + clean) | Paragraph-level dedup |
+
+Applied to all response paths: non-stream (heavy + standard), stream chunks (heavy + standard), and record-map extraction.
+
 ## Configuration
 
 All via environment variables or `.env` file:
@@ -197,6 +213,12 @@ GoTionAPI Server (Go binary)
   │  └─────────┬────────────┘
   ▼            ▼
 Notion API  ─  /api/v3/runInferenceTranscript
+  │
+  ▼
+Response Filter ← strips lang tags, reasoning prefixes, dedup
+  │
+  ▼
+Client (clean OpenAI-compatible response)
 ```
 
 Key technical decisions:
@@ -205,6 +227,7 @@ Key technical decisions:
 - **Fresh TLS spec per connection** — `UTLSIdToSpec(HelloChrome_Auto)` + `ApplyPreset(HelloCustom)`
 - **Pure Go SQLite** (`modernc.org/sqlite`) — no CGO required
 - **API Key auth** — auto-generated on first run, stored in `.apikey`, configurable via `API_KEY` env var
+- **Response filter** — `cleanResponseText()` strips reasoning prefixes, `<lang>` tags, orphan tags, and deduplicates content; `cleanNotionMarkup()` applied per-chunk in stream mode
 
 ## License
 
