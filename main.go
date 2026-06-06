@@ -440,6 +440,15 @@ var (
 	reMemoryContext = regexp.MustCompile(`(?s)<memory-context>.*?</memory-context>`)
 	reHermesMemory  = regexp.MustCompile(`(?s)<hermes-memory>.*?</hermes-memory>`)
 	reHonchoContext = regexp.MustCompile(`(?s)<honcho-context>.*?</honcho-context>`)
+	// JSON artifact patterns — Notion AI tool call outputs that leak into responses
+	reJSONSearchQuery  = regexp.MustCompile(`(?s)\{\s*"default"\s*:\s*\{\s*"questions"\s*:\s*\[.*?\]\s*\}\s*\}`)
+	reJSONPageCreate   = regexp.MustCompile(`(?s)\{\s*"pages"\s*:\s*\[\{.*?\}\]\s*\}`)
+	reJSONGeneric      = regexp.MustCompile(`(?s)\{\s*"(?:default|pages|results|questions|internal)"\s*:.*?\}`)
+	// Reasoning paragraph patterns — long meta-descriptions from Notion AI
+	reReasoningPara    = regexp.MustCompile(`(?is)(?:^|\n\n)(?:no (?:existing )?(?:docs?|documents?|results?) (?:found|were found)|the user (?:is asking|wants|has asked|is trying|needs)|let me (?:try|search|check|look|find|see|create|respond)|(?:since|because) the user|I(?:'ll| will| should| need to| can)? (?:try|search|check|create|find|look|plan|respond|provide)|I'm (?:checking|searching|looking|not sure)|(?:my earlier|the previous) (?:search|plan|document)|given the (?:ambiguity|scope|request)|the page creation failed|it seems there's an issue creating pages)[^.!?\n]{10,700}[.!?]`)
+	// Notion structural markup
+	reColumns = regexp.MustCompile(`(?i)</?column(?:s)?>`)
+	reTableRow = regexp.MustCompile(`(?i)</?(?:table|row|cell|tr|td|th)(?:\s[^>]*)?>`)
 )
 
 func cleanNotionMarkup(text string) string {
@@ -458,7 +467,67 @@ func cleanNotionMarkup(text string) string {
 	for i, line := range lines {
 		lines[i] = reAttrTail.ReplaceAllString(line, "")
 	}
-	return strings.Join(lines, "\n")
+	text = strings.Join(lines, "\n")
+	// 6. Notion structural markup (<columns>, <column>, <table>, <row>, <cell>)
+	text = reColumns.ReplaceAllString(text, "")
+	text = reTableRow.ReplaceAllString(text, "")
+	return text
+}
+
+// stripJSONArtifacts removes balanced JSON-ish tool outputs starting with known keys.
+func stripJSONArtifacts(text string) string {
+	keys := []string{`"pages"`, `"default"`, `"internal"`, `"results"`, `"questions"`}
+	for {
+		start := -1
+		for _, key := range keys {
+			idx := strings.Index(text, "{"+key)
+			if idx == -1 {
+				idx = strings.Index(text, "{ "+key)
+			}
+			if idx >= 0 && (start == -1 || idx < start) {
+				start = idx
+			}
+		}
+		if start == -1 {
+			return text
+		}
+		depth := 0
+		inString := false
+		escape := false
+		end := -1
+		for i := start; i < len(text); i++ {
+			ch := text[i]
+			if escape {
+				escape = false
+				continue
+			}
+			if ch == '\\' && inString {
+				escape = true
+				continue
+			}
+			if ch == '"' {
+				inString = !inString
+				continue
+			}
+			if inString {
+				continue
+			}
+			if ch == '{' {
+				depth++
+			} else if ch == '}' {
+				depth--
+				if depth == 0 {
+					end = i + 1
+					break
+				}
+			}
+		}
+		if end == -1 {
+			// Truncated JSON: drop from start onward.
+			return strings.TrimSpace(text[:start])
+		}
+		text = strings.TrimSpace(text[:start] + "\n" + text[end:])
+	}
 }
 
 // cleanResponseText removes reasoning prefixes, deduplicates content, and strips markup.
@@ -484,6 +553,44 @@ func cleanResponseText(text string) string {
 	// 2. Strip reasoning prefixes that leak from Notion AI
 	text = reReasoningPrefix.ReplaceAllString(text, "")
 
+	// 2.1. Strip JSON artifacts (search queries, page creation outputs)
+	text = stripJSONArtifacts(text)
+	text = reJSONSearchQuery.ReplaceAllString(text, "")
+	text = reJSONPageCreate.ReplaceAllString(text, "")
+	text = reJSONGeneric.ReplaceAllString(text, "")
+
+	// 2.2. Strip reasoning paragraphs (long "The user is asking..." meta-descriptions)
+	for i := 0; i < 4; i++ {
+		cleaned := reReasoningPara.ReplaceAllString(text, "")
+		if cleaned == text {
+			break
+		}
+		text = cleaned
+	}
+
+	// 2.25. If response starts with English tool/reasoning meta before Indonesian answer, cut to answer.
+	lowerText := strings.ToLower(text)
+	if strings.HasPrefix(lowerText, "no results found") || strings.HasPrefix(lowerText, "no existing") || strings.HasPrefix(lowerText, "i didn't find") || strings.HasPrefix(lowerText, "the user ") || strings.HasPrefix(lowerText, "let me ") || strings.HasPrefix(lowerText, "i'll ") {
+		markers := []string{"Tidak ", "Maaf,", "Berikut ", "Oke,", "Saya "}
+		cut := -1
+		for _, marker := range markers {
+			if idx := strings.Index(text, marker); idx >= 0 && (cut == -1 || idx < cut) {
+				cut = idx
+			}
+		}
+		if cut > 0 {
+			text = strings.TrimSpace(text[cut:])
+		}
+	}
+
+	// 2.3. Strip Notion "(1/12)" style pagination artifacts
+	rePagination := regexp.MustCompile(`\(\d+/\d+\)\s*`)
+	text = rePagination.ReplaceAllString(text, "")
+
+	// 2.4. Clean up excessive whitespace from stripped artifacts
+	text = regexp.MustCompile(`\n{3,}`).ReplaceAllString(text, "\n\n")
+	text = strings.TrimSpace(text)
+
 	// 3. Deduplicate: if content appears twice (artifacted + clean), keep only the last copy
 	paragraphs := strings.Split(text, "\n\n")
 	if len(paragraphs) >= 2 {
@@ -497,6 +604,9 @@ func cleanResponseText(text string) string {
 			}
 			if strings.HasPrefix(firstHalf, secondHalf[:minLen]) {
 				text = secondHalf
+			} else if len(secondHalf) > 50 && strings.Contains(firstHalf, secondHalf[:50]) {
+				// Fuzzy: secondHalf content already inside firstHalf → keep first (has more context)
+				text = firstHalf
 			}
 		}
 	}
@@ -1460,10 +1570,10 @@ func notionStreamRequest(ctx context.Context, acc Account, payload map[string]in
 
 // extractTextFromNDJSON parses a Notion NDJSON line and extracts text content.
 // Returns extracted text (may be empty) and whether stream is done.
-func extractTextFromNDJSON(line string) (text string, done bool) {
+func extractTextFromNDJSON(line string) (text string, done bool, source string) {
 	var obj map[string]interface{}
 	if err := json.Unmarshal([]byte(line), &obj); err != nil {
-		return "", false
+		return "", false, ""
 	}
 
 	dataType := strings.ToLower(fmt.Sprintf("%v", obj["type"]))
@@ -1472,7 +1582,7 @@ func extractTextFromNDJSON(line string) (text string, done bool) {
 
 	// Type: done
 	if dataType == "done" || dataType == "complete" || dataType == "stream_end" {
-		return "", true
+		return "", true, "done"
 	}
 
 	// Type: patch-start → may contain error from Notion
@@ -1486,24 +1596,20 @@ func extractTextFromNDJSON(line string) (text string, done bool) {
 							subType, _ := sMap["subType"].(string)
 							log.Printf("Notion ERROR: %s (subType=%s)", msg, subType)
 							if msg != "" {
-								return "Error: " + msg, true
+								return "Error: " + msg, true, "error"
 							}
 						}
 					}
 				}
 			}
 		}
-		return "", false
+		return "", false, ""
 	}
 
-	// Type: record-map → extract final content from thread_message
+	// Type: record-map → skip in streaming (patches/markdown-chat already contain text)
+	// Record-map is final state but would duplicate incremental content.
 	if dataType == "record-map" {
-		text = extractFromRecordMap(obj)
-		if text != "" {
-			text = cleanNotionMarkup(text)
-			debugLog("record-map extracted: %s", truncate(text, 200))
-		}
-		return text, false
+		return "", false, "record-map"
 	}
 
 	// Type: markdown-chat → direct text
@@ -1513,17 +1619,17 @@ func extractTextFromNDJSON(line string) (text string, done bool) {
 			text = cleanNotionMarkup(text)
 			debugLog("markdown-chat extracted: %s", truncate(text, 200))
 		}
-		return text, false
+		return text, false, "markdown-chat"
 	}
 
 	// Type: patch → extract from v array
 	if dataType != "patch" {
-		return "", false
+		return "", false, ""
 	}
 
 	patchesRaw, ok := obj["v"].([]interface{})
 	if !ok {
-		return "", false
+		return "", false, "patch"
 	}
 
 	for _, patchRaw := range patchesRaw {
@@ -1538,7 +1644,7 @@ func extractTextFromNDJSON(line string) (text string, done bool) {
 		}
 	}
 
-	return text, false
+	return text, false, "patch"
 }
 
 // extractTextFromPatch extracts text from a single patch object.
@@ -1982,7 +2088,7 @@ func handleHeavyStreamResponse(w http.ResponseWriter, ctx context.Context, body 
 			continue
 		}
 
-		text, done := extractTextFromNDJSON(line)
+		text, done, _ := extractTextFromNDJSON(line)
 		if text == "" && !done {
 			continue
 		}
@@ -2066,7 +2172,9 @@ func handleHeavyStreamResponse(w http.ResponseWriter, ctx context.Context, body 
 
 // handleHeavyNonStreamResponse collects all and saves
 func handleHeavyNonStreamResponse(w http.ResponseWriter, body io.Reader, chatID, model, convID string) {
-	var result strings.Builder
+	var patchResult strings.Builder
+	var markdownResult strings.Builder
+	var recordMapText string
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 256*1024), 1024*1024)
 
@@ -2076,19 +2184,45 @@ func handleHeavyNonStreamResponse(w http.ResponseWriter, body io.Reader, chatID,
 			continue
 		}
 
-		text, done := extractTextFromNDJSON(line)
+		text, done, source := extractTextFromNDJSON(line)
 		if text != "" {
-			result.WriteString(text)
+			switch source {
+			case "markdown-chat":
+				markdownResult.WriteString(text)
+			case "patch", "error":
+				patchResult.WriteString(text)
+			}
 		}
+
+		// Capture record-map as fallback if incremental sources produce nothing
+		if patchResult.Len() == 0 && markdownResult.Len() == 0 {
+			var obj map[string]interface{}
+			if json.Unmarshal([]byte(line), &obj) == nil {
+				if strings.ToLower(fmt.Sprintf("%v", obj["type"])) == "record-map" {
+					rmText := extractFromRecordMap(obj)
+					if rmText != "" && len(rmText) > len(recordMapText) {
+						recordMapText = cleanNotionMarkup(rmText)
+					}
+				}
+			}
+		}
+
 		if done {
 			break
 		}
 	}
 
-	log.Printf("[HEAVY] Non-stream completed: %d chars total", result.Len())
+	// Pick one source to prevent interleaving: markdown-chat > patch > record-map fallback.
+	totalText := markdownResult.String()
+	if totalText == "" {
+		totalText = patchResult.String()
+	}
+	if totalText == "" && recordMapText != "" {
+		totalText = recordMapText
+		log.Printf("[HEAVY] Used record-map fallback: %d chars", len(totalText))
+	}
 
 	// Save assistant response to DB
-	totalText := result.String()
 	if totalText != "" {
 		convManager.SaveMessage(convID, "assistant", totalText, "")
 		roundIdx := convManager.GetNextRoundIndex(convID)
@@ -2151,7 +2285,7 @@ func handleStreamResponse(w http.ResponseWriter, ctx context.Context, body io.Re
 			continue
 		}
 
-		text, done := extractTextFromNDJSON(line)
+		text, done, _ := extractTextFromNDJSON(line)
 		if text == "" && !done {
 			continue
 		}
@@ -2237,7 +2371,8 @@ func sendFinalChunk(w http.ResponseWriter, flusher http.Flusher, chatID, model s
 // ============================================================
 
 func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, chatID, model string) {
-	var result strings.Builder
+	var patchResult strings.Builder
+	var markdownResult strings.Builder
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 256*1024), 1024*1024)
 
@@ -2247,16 +2382,25 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, chatID, mode
 			continue
 		}
 
-		text, done := extractTextFromNDJSON(line)
+		text, done, source := extractTextFromNDJSON(line)
 		if text != "" {
-			result.WriteString(text)
+			switch source {
+			case "markdown-chat":
+				markdownResult.WriteString(text)
+			case "patch", "error":
+				patchResult.WriteString(text)
+			}
 		}
 		if done {
 			break
 		}
 	}
 
-	log.Printf("Non-stream completed: %d chars total", result.Len())
+	totalText := markdownResult.String()
+	if totalText == "" {
+		totalText = patchResult.String()
+	}
+	log.Printf("Non-stream completed: %d chars total", len(totalText))
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(ChatCompletionResponse{
@@ -2266,7 +2410,7 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.Reader, chatID, mode
 		Model:   model,
 		Choices: []ChatCompletionChoice{{
 			Index:   0,
-			Message: &ChatMessage{Role: "assistant", Content: contentRaw(cleanResponseText(result.String()))},
+			Message: &ChatMessage{Role: "assistant", Content: contentRaw(cleanResponseText(totalText))},
 		}},
 		Usage:             &UsageInfo{PromptTokens: 0, CompletionTokens: 0, TotalTokens: 0},
 		SystemFingerprint: "fp_gotionapi",
