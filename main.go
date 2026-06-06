@@ -432,8 +432,14 @@ var (
 	reLangClose   = regexp.MustCompile(`</lang>`)
 	rePrimaryAttr = regexp.MustCompile(`(?i)\bprimary="[a-zA-Z\-]{1,15}"\s*`)
 	reAttrTail        = regexp.MustCompile(`^-?[a-zA-Z]{0,4}"\s*>\s*`)
-	reReasoningPrefix = regexp.MustCompile(`(?i)^(?:general knowledge question|simple request|the user (?:wants|is asking)|this is (?:a )?(?:general|simple|straightforward)|no need to (?:search|look up)|search(?:ing)? (?:for|not needed))[.!?\s]*`)
+	reReasoningPrefix = regexp.MustCompile(`(?i)^(?:general knowledge question[.!?]|simple (?:\w+ )+in \w+[.!?]|simple \w+[.!?]|simple (?:\w+ )*(?:question|request)\w*[.!?]|the user (?:wants|is asking)[^.]*[.!?]|this is (?:a )?(?:general|simple|straightforward)[^.]*[.!?]|no need to (?:search|look up)[^.]*[.!?]|search(?:ing)? (?:for|not needed)[^.]*[.!?]|a (?:simple|brief|quick|short) \w+[.!?])[\s]*`)
+	// Trailing reasoning suffixes — same patterns but anchored at end of string
+	reReasoningSuffix = regexp.MustCompile(`(?i)[.!?]\s*(?:general knowledge question|simple (?:\w+ )+in \w+|simple (?:\w+ )*(?:question|request)\w*|the user (?:wants|is asking)[^.]*|this is (?:a )?(?:general|simple|straightforward)[^.]*|no need to (?:search|look up)[^.]*|search(?:ing)? (?:for|not needed)[^.]*|a (?:simple|brief|quick|short) \w+)[.!?]$`)
 	reOrphanLangOpen = regexp.MustCompile(`<lang\b[^>]*$`)
+	// Input filtering — strip framework injection blocks before sending to Notion
+	reMemoryContext = regexp.MustCompile(`(?s)<memory-context>.*?</memory-context>`)
+	reHermesMemory  = regexp.MustCompile(`(?s)<hermes-memory>.*?</hermes-memory>`)
+	reHonchoContext = regexp.MustCompile(`(?s)<honcho-context>.*?</honcho-context>`)
 )
 
 func cleanNotionMarkup(text string) string {
@@ -464,27 +470,108 @@ func cleanResponseText(text string) string {
 	// 1. Clean Notion markup (lang tags, br tags, etc.)
 	text = cleanNotionMarkup(text)
 
+	// 1.5. Bookend detection: if text starts+ends with same short reasoning fragment, strip both
+	reBookend := regexp.MustCompile(`(?i)^(?:simple|greeting|knowledge|question|request|straightforward|brief|searching|no need|a (?:simple|brief|quick|short))[^.!?]{0,60}[.!?]`)
+	if m := reBookend.FindString(text); len(m) > 5 && len(m) < 80 {
+		rest := text[len(m):]
+		if strings.HasSuffix(rest, m) {
+			text = strings.TrimSpace(rest[:len(rest)-len(m)])
+		} else {
+			text = strings.TrimSpace(rest)
+		}
+	}
+
 	// 2. Strip reasoning prefixes that leak from Notion AI
 	text = reReasoningPrefix.ReplaceAllString(text, "")
 
 	// 3. Deduplicate: if content appears twice (artifacted + clean), keep only the last copy
 	paragraphs := strings.Split(text, "\n\n")
-	if len(paragraphs) >= 4 {
+	if len(paragraphs) >= 2 {
 		half := len(paragraphs) / 2
 		firstHalf := strings.TrimSpace(strings.Join(paragraphs[:half], "\n\n"))
 		secondHalf := strings.TrimSpace(strings.Join(paragraphs[half:], "\n\n"))
 		if len(firstHalf) > 20 && len(secondHalf) > 20 {
-			// Check if second half starts with same content as first half
-			minLen := len(firstHalf)
-			if minLen > 100 {
-				minLen = 100
+			minLen := len(secondHalf)
+			if minLen > 50 {
+				minLen = 50
 			}
-			if strings.HasPrefix(secondHalf, firstHalf[:minLen]) {
+			if strings.HasPrefix(firstHalf, secondHalf[:minLen]) {
 				text = secondHalf
 			}
 		}
 	}
 
+	// 4. Strip trailing reasoning fragments (short meta-descriptions appended after content)
+	lines := strings.Split(text, "\n")
+	punctRunes := ".!?。！？）)"
+	if len(lines) > 0 {
+		lastLine := strings.TrimSpace(lines[len(lines)-1])
+		if len(lastLine) > 0 && len(lastLine) < 60 {
+			lastRunes := []rune(lastLine)
+			lastChar := lastRunes[len(lastRunes)-1]
+			isPunctuation := strings.ContainsRune(punctRunes, lastChar)
+			if !isPunctuation {
+				for i := len(lines) - 2; i >= 0; i-- {
+					prev := strings.TrimSpace(lines[i])
+					if prev == "" {
+						continue
+					}
+					prevRunes := []rune(prev)
+					prevLast := prevRunes[len(prevRunes)-1]
+					if strings.ContainsRune(punctRunes, prevLast) {
+						lines = lines[:len(lines)-1]
+						text = strings.TrimSpace(strings.Join(lines, "\n"))
+					}
+					break
+				}
+			}
+		}
+	}
+
+	// 5. Strip trailing reasoning prefix (e.g. "Simple greeting." appended after real content)
+	lines = strings.Split(text, "\n")
+	if len(lines) > 1 {
+		lastLine := strings.TrimSpace(lines[len(lines)-1])
+		if len(lastLine) > 0 && len(lastLine) < 60 && reReasoningPrefix.MatchString(lastLine) {
+			hasContent := false
+			for i := len(lines) - 2; i >= 0; i-- {
+				if strings.TrimSpace(lines[i]) != "" {
+					hasContent = true
+					break
+				}
+			}
+			if hasContent {
+				lines = lines[:len(lines)-1]
+				text = strings.TrimSpace(strings.Join(lines, "\n"))
+			}
+		}
+	}
+
+	// 6. Strip trailing reasoning suffix inline (e.g., "...😊Simple greeting in Indonesian.")
+	// Locate a reasoning meta-pattern near the end and strip from there.
+	reasoningTail := `(?i)(?:general knowledge question[.!?]|simple [^.!?]{1,60}[.!?]|the user (?:wants|is asking)[^.]*[.!?]|this is (?:a )?(?:general|simple|straightforward)[^.]*[.!?]|no need to (?:search|look up)[^.]*[.!?]|search(?:ing)? (?:for|not needed)[^.]*[.!?]|a (?:simple|brief|quick|short) [^.!?]{1,30}[.!?])`
+	if len(text) > 80 {
+		tail := text[len(text)-80:]
+		re := regexp.MustCompile(reasoningTail)
+		loc := re.FindStringIndex(tail)
+		if loc != nil {
+			cutAt := len(text) - 80 + loc[0]
+			text = strings.TrimSpace(text[:cutAt])
+		}
+	}
+
+	return strings.TrimSpace(text)
+}
+
+// cleanInputText strips framework injection blocks from user input before sending to Notion.
+// Prevents memory-context, hermes-memory, honcho-context blocks from confusing Notion AI.
+func cleanInputText(text string) string {
+	if text == "" {
+		return text
+	}
+	text = reMemoryContext.ReplaceAllString(text, "")
+	text = reHermesMemory.ReplaceAllString(text, "")
+	text = reHonchoContext.ReplaceAllString(text, "")
 	return strings.TrimSpace(text)
 }
 
@@ -1242,7 +1329,7 @@ func buildTranscript(req ChatCompletionRequest, acc Account, notionModel, thread
 			transcript = append(transcript, map[string]interface{}{
 				"id":        genUUID(),
 				"type":      "user",
-				"value":     [][]string{{"[System]: " + extractContentString(msg.Content)}},
+				"value":     [][]string{{"[System]: " + cleanInputText(extractContentString(msg.Content))}},
 				"userId":    acc.UserID,
 				"createdAt": time.Now().Format(time.RFC3339Nano),
 			})
@@ -1250,7 +1337,7 @@ func buildTranscript(req ChatCompletionRequest, acc Account, notionModel, thread
 			transcript = append(transcript, map[string]interface{}{
 				"id":        genUUID(),
 				"type":      "user",
-				"value":     [][]string{{extractContentString(msg.Content)}},
+				"value":     [][]string{{cleanInputText(extractContentString(msg.Content))}},
 				"userId":    acc.UserID,
 				"createdAt": time.Now().Format(time.RFC3339Nano),
 			})
@@ -1262,7 +1349,7 @@ func buildTranscript(req ChatCompletionRequest, acc Account, notionModel, thread
 			})
 		case "tool":
 			// Tool results — treat as user context for Notion
-			content := extractContentString(msg.Content)
+			content := cleanInputText(extractContentString(msg.Content))
 			if content != "" {
 				transcript = append(transcript, map[string]interface{}{
 					"id":        genUUID(),
@@ -1274,7 +1361,7 @@ func buildTranscript(req ChatCompletionRequest, acc Account, notionModel, thread
 			}
 		default:
 			// Unknown role — treat as user message
-			content := extractContentString(msg.Content)
+			content := cleanInputText(extractContentString(msg.Content))
 			if content != "" {
 				transcript = append(transcript, map[string]interface{}{
 					"id":        genUUID(),
@@ -1296,7 +1383,7 @@ func buildLiteTranscript(req ChatCompletionRequest, acc Account, notionModel, th
 	lastUserMsg := ""
 	for i := len(req.Messages) - 1; i >= 0; i-- {
 		if req.Messages[i].Role == "user" {
-			lastUserMsg = extractContentString(req.Messages[i].Content)
+			lastUserMsg = cleanInputText(extractContentString(req.Messages[i].Content))
 			break
 		}
 	}
@@ -1798,7 +1885,7 @@ func handleHeavyRequest(w http.ResponseWriter, r *http.Request, req ChatCompleti
 	lastUserMsg := ""
 	for i := len(req.Messages) - 1; i >= 0; i-- {
 		if req.Messages[i].Role == "user" {
-			lastUserMsg = extractContentString(req.Messages[i].Content)
+			lastUserMsg = cleanInputText(extractContentString(req.Messages[i].Content))
 			break
 		}
 	}
